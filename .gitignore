@@ -3,3 +3,7 @@
 *.pem
 github-key
 github-key.pub
+
+# Generated Helm packages and local verification reports
+*.tgz
+/artifacts/

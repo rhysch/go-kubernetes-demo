@@ -17,6 +17,7 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -25,6 +26,50 @@ jobs:
           cache: false
       - name: Test
         run: go test -race -v ./...
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+      - name: Validate Helm chart
+        run: |
+          helm lint charts/go-web --strict
+          helm template go-web charts/go-web --namespace go-cicd-helm > /tmp/go-web-helm.yaml
+          helm template go-web charts/go-web --namespace go-cicd-helm -f charts/go-web/values-vm.yaml > /tmp/go-web-helm-vm.yaml
+      - name: Install kind for local Kubernetes checks
+        run: |
+          curl -fsSL https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64 -o "$RUNNER_TEMP/kind-linux-amd64"
+          curl -fsSL https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64.sha256sum -o "$RUNNER_TEMP/kind-linux-amd64.sha256sum"
+          (cd "$RUNNER_TEMP" && sha256sum --check kind-linux-amd64.sha256sum)
+          chmod +x "$RUNNER_TEMP/kind-linux-amd64"
+          mkdir -p "$RUNNER_TEMP/helm-check-bin"
+          mv "$RUNNER_TEMP/kind-linux-amd64" "$RUNNER_TEMP/helm-check-bin/kind"
+          echo "$RUNNER_TEMP/helm-check-bin" >> "$GITHUB_PATH"
+      - name: Create disposable CI cluster and load application image
+        run: |
+          docker build -t go-web:helm-ci .
+          kind create cluster --name go-web-helm-ci --kubeconfig "$RUNNER_TEMP/go-web-helm-kubeconfig" --wait 180s
+          kind load docker-image go-web:helm-ci --name go-web-helm-ci
+      - name: Verify Helm install, upgrade, tests and rollback
+        env:
+          KUBECONFIG: ${{ runner.temp }}/go-web-helm-kubeconfig
+          KUBE_CONTEXT: kind-go-web-helm-ci
+          HELM_TEST_NAMESPACE: go-web-helm-check-ci
+          HELM_TEST_IMAGE_REPOSITORY: go-web
+          HELM_TEST_IMAGE_TAG: helm-ci
+          HELM_REPORT_DIR: ${{ runner.temp }}/go-web-helm-report
+        run: bash scripts/verify-helm.sh
+      - name: Save Helm verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-verification
+          path: ${{ runner.temp }}/go-web-helm-report
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove CI cluster
+        if: always()
+        run: |
+          if command -v kind >/dev/null; then kind delete cluster --name go-web-helm-ci; fi
       - uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
@@ -41,33 +86,44 @@ jobs:
           tags: rhys561d/go-web:${{ github.sha }}
 
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && vars.ENABLE_VM_DEPLOYMENT == 'true'
     needs: ci
     runs-on: [self-hosted, linux, x64, go-vm]
     timeout-minutes: 10
     env:
-      IMAGE: rhys561d/go-web:${{ github.sha }}
+      IMAGE_REPOSITORY: rhys561d/go-web
+      HELM_NAMESPACE: go-cicd-helm
+      HELM_RELEASE: go-web
+      INGRESS_HOST: ${{ vars.HELM_INGRESS_HOST }}
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare manifest
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+      - name: Upgrade Helm release
         run: |
-          sed -E "s|^([[:space:]]*)image:.*|\1image: $IMAGE|" \
-            k8s/deployment.yaml > "$RUNNER_TEMP/go-web-deployment.yaml"
-      - name: Apply resources
+          test -n "$INGRESS_HOST" || { echo "Set HELM_INGRESS_HOST before enabling VM deployment" >&2; exit 1; }
+          sudo -n "$(command -v helm)" --kubeconfig /etc/rancher/k3s/k3s.yaml upgrade --install "$HELM_RELEASE" charts/go-web \
+            --namespace "$HELM_NAMESPACE" --create-namespace \
+            -f charts/go-web/values-vm.yaml \
+            --set-string "image.repository=$IMAGE_REPOSITORY" \
+            --set-string "image.tag=$GITHUB_SHA" \
+            --set-string "ingress.host=$INGRESS_HOST" \
+            --atomic --timeout 180s --history-max 5
+      - name: Test Service and verify Ingress
         run: |
-          sudo -n k3s kubectl apply -f k8s/namespace.yaml
-          sudo -n k3s kubectl apply -f "$RUNNER_TEMP/go-web-deployment.yaml"
-          sudo -n k3s kubectl apply -f k8s/service.yaml
-          sudo -n k3s kubectl apply -f k8s/ingress-vm.yaml
-      - name: Verify rollout and Ingress
-        run: |
-          sudo -n k3s kubectl rollout status deployment/go-web -n go-cicd --timeout=180s
+          sudo -n "$(command -v helm)" --kubeconfig /etc/rancher/k3s/k3s.yaml test "$HELM_RELEASE" --namespace "$HELM_NAMESPACE" --timeout 90s
+          deployed=$(sudo -n k3s kubectl get deployment "$HELM_RELEASE" -n "$HELM_NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
+          test "$deployed" = "$IMAGE_REPOSITORY:$GITHUB_SHA"
           curl -fsS --retry 10 --retry-delay 3 --retry-all-errors \
             --connect-timeout 5 --max-time 10 \
-            -H 'Host: go-web.13.201.98.93.sslip.io' http://127.0.0.1/healthz
+            -H "Host: $INGRESS_HOST" http://127.0.0.1/healthz
       - name: Diagnostics
         if: failure()
         run: |
-          sudo -n k3s kubectl get pods -n go-cicd
-          sudo -n k3s kubectl get events -n go-cicd --sort-by=.metadata.creationTimestamp
-          sudo -n k3s kubectl logs deployment/go-web -n go-cicd --all-containers --tail=50 || true
+          sudo -n "$(command -v helm)" --kubeconfig /etc/rancher/k3s/k3s.yaml status "$HELM_RELEASE" -n "$HELM_NAMESPACE" || true
+          sudo -n "$(command -v helm)" --kubeconfig /etc/rancher/k3s/k3s.yaml history "$HELM_RELEASE" -n "$HELM_NAMESPACE" || true
+          sudo -n k3s kubectl get pods -n "$HELM_NAMESPACE"
+          sudo -n k3s kubectl get events -n "$HELM_NAMESPACE" --sort-by=.metadata.creationTimestamp
+          sudo -n k3s kubectl logs deployment/"$HELM_RELEASE" -n "$HELM_NAMESPACE" --all-containers --tail=50 || true

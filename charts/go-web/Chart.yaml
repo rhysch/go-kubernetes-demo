@@ -1,0 +1,7 @@
+apiVersion: v2
+name: go-web
+description: Go website with a Service and Traefik Ingress
+type: application
+version: 0.2.0
+appVersion: "v1"
+kubeVersion: ">=1.22.0-0"
